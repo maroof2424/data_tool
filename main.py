@@ -496,7 +496,7 @@ DATASET BRIEF:
 
             st.session_state.chat_messages.append(("user", q))
             st.session_state.chat_messages.append(("assistant", answer))
-            st.experimental_rerun()
+            st.rerun()
 
 else:
     # Welcome / Sample
