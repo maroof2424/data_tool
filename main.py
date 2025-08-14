@@ -1,931 +1,529 @@
-# app.py - Improved Version
+# app.py — Advanced Data Profiling + Cleaning + Visualizations + Gemini Chatbot
+import os, io, warnings
+warnings.filterwarnings("ignore")
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import seaborn as sns
-import matplotlib.pyplot as plt
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import io
-from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
 from scipy import stats
-import warnings
-warnings.filterwarnings('ignore')
 
-# Page configuration
-st.set_page_config(
-    page_title="Advanced Data Profiling & Cleaning App", 
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Viz
+import plotly.express as px
 
-# Custom CSS for better styling
+# ML utils
+from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
+
+# Gemini
+import google.generativeai as genai
+
+# ------------------------- Page Config & Styles -------------------------
+st.set_page_config(page_title="Advanced Data Profiling + Gemini Chat", layout="wide", initial_sidebar_state="expanded")
+st.title("📊 Advanced Data Profiling & Cleaning App + 🤖 Gemini Chat")
 st.markdown("""
 <style>
-.metric-container {
-    background-color: #f0f2f6;
-    padding: 10px;
-    border-radius: 10px;
-    margin: 5px 0;
-}
-.stProgress > div > div > div > div {
-    background-color: #1f77b4;
-}
+.metric-container { background:#f6f7fb; padding:10px; border-radius:12px; }
+.small { color:#6b7280; font-size:12px; }
 </style>
 """, unsafe_allow_html=True)
-
-st.title("📊 Advanced Data Profiling & Cleaning App")
 st.markdown("---")
 
-# Initialize session state
-if 'processed_data' not in st.session_state:
-    st.session_state.processed_data = None
-if 'original_data' not in st.session_state:
-    st.session_state.original_data = None
+# ------------------------- Session State -------------------------
+for k, v in {
+    "processed_data": None,
+    "original_data": None,
+    "last_uploaded_file": None,
+    "gemini_chat": None,
+    "gemini_key": None,
+    "data_brief": ""
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# Utility Functions
+# ------------------------- Helpers -------------------------
 @st.cache_data
 def load_data(file):
-    """Load data with caching for performance"""
     try:
         if file.name.endswith(".csv"):
-            df = pd.read_csv(file)
+            return pd.read_csv(file), None
         else:
-            df = pd.read_excel(file)
-        return df, None
+            return pd.read_excel(file), None
     except Exception as e:
         return None, str(e)
 
 @st.cache_data
-def detect_outliers_multiple_methods(df, column):
-    """Detect outliers using multiple methods"""
-    methods = {}
-    
-    # IQR Method
-    Q1 = df[column].quantile(0.25)
-    Q3 = df[column].quantile(0.75)
-    IQR = Q3 - Q1
-    iqr_outliers = df[(df[column] < Q1 - 1.5 * IQR) | (df[column] > Q3 + 1.5 * IQR)]
-    methods['IQR'] = len(iqr_outliers)
-    
-    # Z-Score Method
-    z_scores = np.abs(stats.zscore(df[column].dropna()))
-    z_outliers = len(z_scores[z_scores > 3])
-    methods['Z-Score'] = z_outliers
-    
-    # Modified Z-Score Method
-    median = df[column].median()
-    mad = np.median(np.abs(df[column] - median))
-    modified_z_scores = 0.6745 * (df[column] - median) / mad
-    modified_z_outliers = len(modified_z_scores[np.abs(modified_z_scores) > 3.5])
-    methods['Modified Z-Score'] = modified_z_outliers
-    
-    return methods
+def detect_outliers_counts(df, numeric_cols):
+    out_counts = {}
+    for col in numeric_cols:
+        s = df[col].dropna()
+        if s.empty: 
+            out_counts[col] = {"IQR": 0, "Z": 0, "ModZ": 0}
+            continue
+        # IQR
+        Q1, Q3 = s.quantile(0.25), s.quantile(0.75)
+        IQR = Q3 - Q1 if pd.notnull(Q3) and pd.notnull(Q1) else 0
+        iqr_ct = int(((s < Q1 - 1.5*IQR) | (s > Q3 + 1.5*IQR)).sum()) if IQR != 0 else 0
+        # Z
+        z = np.abs(stats.zscore(s, nan_policy="omit"))
+        z_ct = int((z > 3).sum()) if isinstance(z, np.ndarray) else 0
+        # Modified Z
+        med = np.median(s)
+        mad = np.median(np.abs(s - med)) if len(s) else 0
+        if mad == 0:
+            modz_ct = 0
+        else:
+            modz = 0.6745 * (s - med) / mad
+            modz_ct = int((np.abs(modz) > 3.5).sum())
+        out_counts[col] = {"IQR": iqr_ct, "Z": z_ct, "ModZ": modz_ct}
+    return out_counts
 
 def safe_mode_fill(series):
-    """Safely fill with mode, handle empty mode"""
     mode_values = series.mode()
     if len(mode_values) > 0:
         return mode_values.iloc[0]
-    else:
-        return series.median() if series.dtype in ['int64', 'float64'] else 'Unknown'
+    return series.median() if pd.api.types.is_numeric_dtype(series) else "Unknown"
 
-    # ---- Sidebar Configuration ----
+def build_data_brief(df: pd.DataFrame, max_cats=12) -> str:
+    """Compact profile string for LLM context."""
+    lines = []
+    lines.append(f"ROWS={len(df)}, COLS={len(df.columns)}")
+    # dtypes
+    dtypes = {c: str(t) for c, t in df.dtypes.items()}
+    lines.append("DTYPES=" + "; ".join([f"{c}:{t}" for c, t in dtypes.items()]))
+
+    # missing
+    miss = df.isnull().sum()
+    miss_pct = (miss/len(df)*100).round(2)
+    if len(miss[miss>0]) > 0:
+        lines.append("MISSING=" + "; ".join([f"{c}:{int(miss[c])} ({miss_pct[c]}%)" for c in miss.index if miss[c]>0]))
+    else:
+        lines.append("MISSING=None")
+
+    # numeric stats (subset to 8 cols for brevity)
+    num_cols = df.select_dtypes(include=np.number).columns.tolist()[:8]
+    if num_cols:
+        lines.append("NUMERIC_SUMMARY=")
+        for c in num_cols:
+            s = df[c].dropna()
+            if s.empty: continue
+            lines.append(f"  {c}: min={s.min():.3g}, q1={s.quantile(.25):.3g}, med={s.median():.3g}, q3={s.quantile(.75):.3g}, max={s.max():.3g}, mean={s.mean():.3g}, std={s.std():.3g}, skew={s.skew():.3g}")
+
+    # categorical top values
+    cat_cols = df.select_dtypes(include=["object","category"]).columns.tolist()[:8]
+    if cat_cols:
+        lines.append("CATEGORICAL_TOPS=")
+        for c in cat_cols:
+            vc = df[c].astype(str).value_counts(dropna=True).head(5)
+            joined = ", ".join([f"{i}:{int(v)}" for i, v in vc.items()])
+            lines.append(f"  {c}: {joined}")
+
+    # outlier counts snapshot
+    if num_cols:
+        outs = detect_outliers_counts(df, num_cols)
+        lines.append("OUTLIERS_SNAPSHOT=" + "; ".join([f"{c}(IQR={o['IQR']},Z={o['Z']},MZ={o['ModZ']})" for c, o in outs.items()]))
+
+    return "\n".join(lines)
+
+def ensure_gemini(model_name="gemini-1.5-flash"):
+    key = st.session_state.gemini_key or os.getenv("GEMINI_API_KEY")
+    if not key:
+        st.warning("⚠️ Gemini API key is missing. Add it in the sidebar or set GEMINI_API_KEY env var.")
+        return None
+    try:
+        genai.configure(api_key=key)
+        model = genai.GenerativeModel(model_name)
+        # initialize chat session once
+        if st.session_state.gemini_chat is None:
+            st.session_state.gemini_chat = model.start_chat(history=[
+                {"role": "user", "parts": ["You are a data analyst assistant. Answer concisely with clear bullet points and, when helpful, short formulas. If unsure, ask a scoped follow-up."]},
+                {"role": "model", "parts": ["Understood. I'll analyze the provided dataset context."]},
+            ])
+        return st.session_state.gemini_chat
+    except Exception as e:
+        st.error(f"Gemini init error: {e}")
+        return None
+
+# ------------------------- Sidebar -------------------------
 st.sidebar.header("🔧 Configuration")
 
-# Show current data info in sidebar
-if st.session_state.original_data is not None:
-    with st.sidebar.expander("📊 Current Data Info", expanded=True):
-        current_file = getattr(st.session_state, 'last_uploaded_file', 'Unknown')
-        st.write(f"**File:** {current_file}")
-        st.write(f"**Rows:** {len(st.session_state.processed_data):,}")
-        st.write(f"**Columns:** {len(st.session_state.processed_data.columns)}")
-        
-        # Clear data button in sidebar
-        if st.button("🗑️ Clear Current Data", type="secondary", use_container_width=True):
-            st.session_state.original_data = None
-            st.session_state.processed_data = None
-            if 'last_uploaded_file' in st.session_state:
-                del st.session_state.last_uploaded_file
-            st.rerun()
+# Gemini key input (optional if env var set)
+st.session_state.gemini_key = st.sidebar.text_input("Gemini API Key (optional if set via env)", type="password", value=st.session_state.gemini_key or "")
 
-# File Upload
-uploaded_file = st.sidebar.file_uploader(
-    "Choose CSV or Excel file", 
-    type=["csv", "xlsx"],
-    help="Upload your dataset for analysis and cleaning",
-    key="file_uploader"
-)
+uploaded_file = st.sidebar.file_uploader("Upload CSV/Excel", type=["csv","xlsx"], key="file_uploader")
 
-# Reset session state when new file is uploaded
+# Clear btn
+if st.sidebar.button("🗑️ Clear Data", use_container_width=True):
+    for k in ["processed_data","original_data","last_uploaded_file","data_brief"]:
+        st.session_state[k] = None
+    st.rerun()
+
+# ------------------------- Load Data -------------------------
 if uploaded_file:
-    # Check if this is a new file
-    if 'last_uploaded_file' not in st.session_state or st.session_state.last_uploaded_file != uploaded_file.name:
-        st.session_state.last_uploaded_file = uploaded_file.name
-        st.session_state.original_data = None
+    # reset if new file
+    if st.session_state.last_uploaded_file != uploaded_file.name:
         st.session_state.processed_data = None
-    
-    # Load data with progress bar
+        st.session_state.original_data = None
+        st.session_state.last_uploaded_file = uploaded_file.name
+
     with st.spinner("Loading dataset..."):
-        df, error = load_data(uploaded_file)
-    
-    if error:
-        st.error(f"❌ Error loading file: {error}")
+        df, err = load_data(uploaded_file)
+    if err:
+        st.error(f"❌ {err}")
         st.stop()
-    
-    # Store original data (only once per file)
+
     if st.session_state.original_data is None:
         st.session_state.original_data = df.copy()
         st.session_state.processed_data = df.copy()
-    
-    st.success("✅ File uploaded successfully!")
-    
-    # Dataset size warning
-    if len(df) > 10000:
-        st.warning(f"⚠️ Large dataset detected ({len(df):,} rows). Some operations might be slower.")
-    
-    # ---- Main Content ----
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📋 Overview", "🔍 Data Quality", "🛠 Cleaning", "📊 Visualizations", "💾 Export"
+        st.session_state.data_brief = build_data_brief(df)
+
+    st.success("✅ File loaded")
+
+    # --------------------- Tabs ---------------------
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "📋 Overview", "🔍 Data Quality", "🛠 Cleaning", "📊 Visualizations", "💾 Export", "🤖 AI Chat"
     ])
-    
-    # ---- TAB 1: Overview ----
+
+    # ---------- TAB 1: Overview ----------
     with tab1:
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("📏 Rows", f"{df.shape[0]:,}")
-        with col2:
-            st.metric("📊 Columns", df.shape[1])
-        with col3:
-            st.metric("💾 Memory Usage", f"{df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
-        with col4:
-            st.metric("🔢 Numeric Columns", len(df.select_dtypes(include=np.number).columns))
-        
-        st.subheader("👀 Dataset Preview")
-        
-        # Pagination for large datasets
-        if len(df) > 100:
-            page_size = st.selectbox("Rows per page", [50, 100, 200, 500], index=1)
-            page_num = st.number_input("Page", min_value=1, max_value=max(1, len(df)//page_size + 1), value=1)
-            start_idx = (page_num - 1) * page_size
-            end_idx = min(start_idx + page_size, len(df))
-            st.write(f"Showing rows {start_idx+1} to {end_idx} of {len(df)}")
-            display_df = df.iloc[start_idx:end_idx]
-        else:
-            display_df = df
-        
-        # Editable dataframe
-        edited_df = st.data_editor(
-            display_df, 
-            num_rows="dynamic", 
-            use_container_width=True,
-            hide_index=True
-        )
-        
-        # Update session state if edited
-        if not edited_df.equals(display_df):
-            st.session_state.processed_data = edited_df
-            st.success("✅ Data updated in memory!")
-        
-        # Column Information
-        st.subheader("📊 Column Information")
-        col_info = pd.DataFrame({
-            'Data Type': df.dtypes,
-            'Non-Null Count': df.count(),
-            'Null Count': df.isnull().sum(),
-            'Null %': (df.isnull().sum() / len(df) * 100).round(2),
-            'Unique Values': df.nunique(),
-            'Unique %': (df.nunique() / len(df) * 100).round(2)
+        cur = st.session_state.processed_data
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Rows", f"{len(cur):,}")
+        c2.metric("Columns", cur.shape[1])
+        c3.metric("Memory (MB)", f"{cur.memory_usage(deep=True).sum()/1024**2:.2f}")
+        c4.metric("Numeric Cols", len(cur.select_dtypes(include=np.number).columns))
+
+        st.subheader("👀 Preview (editable)")
+        show_n = st.slider("Rows to show", 5, min(1000, len(cur)), 10)
+        edited = st.data_editor(cur.head(show_n), num_rows="dynamic", use_container_width=True, hide_index=True)
+        if not edited.equals(cur.head(show_n)):
+            # apply edits back to processed_data (head-only edits patched)
+            st.session_state.processed_data.update(edited)
+            st.session_state.data_brief = build_data_brief(st.session_state.processed_data)
+            st.success("✅ Edits applied to in-memory data")
+
+        st.subheader("📊 Column Info")
+        info = pd.DataFrame({
+            "dtype": cur.dtypes.astype(str),
+            "non_null": cur.count(),
+            "null": cur.isnull().sum(),
+            "null_%": (cur.isnull().sum()/len(cur)*100).round(2),
+            "unique": cur.nunique(),
+            "unique_%": (cur.nunique()/len(cur)*100).round(2)
         })
-        st.dataframe(col_info, use_container_width=True)
-    
-    # ---- TAB 2: Data Quality ----
+        st.dataframe(info, use_container_width=True)
+
+    # ---------- TAB 2: Data Quality ----------
     with tab2:
-        st.subheader("🔍 Data Quality Assessment")
-        
-        # Missing Values Analysis
-        st.write("### 🕳️ Missing Values Analysis")
-        missing_data = df.isnull().sum()
-        missing_data = missing_data[missing_data > 0].sort_values(ascending=False)
-        
-        if len(missing_data) > 0:
-            col1, col2 = st.columns([2, 1])
+        cur = st.session_state.processed_data
+        st.subheader("🕳️ Missing Values")
+        miss = cur.isnull().sum()
+        miss = miss[miss>0].sort_values(ascending=False)
+        if len(miss):
+            col1,col2 = st.columns([2,1])
             with col1:
-                fig = px.bar(
-                    x=missing_data.index,
-                    y=missing_data.values,
-                    title="Missing Values by Column",
-                    labels={'x': 'Columns', 'y': 'Missing Count'}
-                )
+                fig = px.bar(x=miss.index, y=miss.values, labels={"x":"Columns","y":"Missing Count"}, title="Missing by Column")
                 st.plotly_chart(fig, use_container_width=True)
-            
             with col2:
-                st.dataframe(
-                    pd.DataFrame({
-                        'Missing Count': missing_data,
-                        'Missing %': (missing_data / len(df) * 100).round(2)
-                    })
-                )
+                st.dataframe(pd.DataFrame({"Missing": miss, "Missing_%": (miss/len(cur)*100).round(2)}))
         else:
-            st.success("🎉 No missing values found!")
-        
-        # Duplicate Analysis
-        st.write("### 🔄 Duplicate Analysis")
-        duplicate_count = df.duplicated().sum()
-        if duplicate_count > 0:
-            st.warning(f"⚠️ Found {duplicate_count} duplicate rows ({duplicate_count/len(df)*100:.2f}%)")
-            if st.button("Show Duplicate Rows"):
-                st.dataframe(df[df.duplicated(keep=False)].sort_values(df.columns.tolist()))
+            st.success("No missing values 🎉")
+
+        st.subheader("🔄 Duplicates")
+        dups = cur.duplicated().sum()
+        if dups:
+            st.warning(f"Found {dups} duplicate rows ({dups/len(cur)*100:.2f}%)")
+            if st.button("Show Duplicates"):
+                st.dataframe(cur[cur.duplicated(keep=False)].sort_values(cur.columns.tolist()), use_container_width=True)
         else:
-            st.success("✅ No duplicate rows found!")
-        
-        # Outlier Analysis
-        st.write("### 🚨 Outlier Analysis")
-        numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-        
-        if numeric_cols:
-            selected_col = st.selectbox("Select column for outlier analysis", numeric_cols)
-            
-            if selected_col:
-                outlier_methods = detect_outliers_multiple_methods(df, selected_col)
-                
-                col1, col2 = st.columns([1, 1])
-                with col1:
-                    st.write("**Outlier Detection Results:**")
-                    for method, count in outlier_methods.items():
-                        st.metric(f"{method} Method", f"{count} outliers")
-                
-                with col2:
-                    # Box plot for outliers
-                    fig = px.box(df, y=selected_col, title=f"Box Plot - {selected_col}")
-                    st.plotly_chart(fig, use_container_width=True)
+            st.success("No duplicate rows ✅")
+
+        st.subheader("🚨 Outlier Snapshot")
+        num_cols = cur.select_dtypes(include=np.number).columns.tolist()
+        if num_cols:
+            out_counts = detect_outliers_counts(cur, num_cols)
+            out_df = pd.DataFrame(out_counts).T
+            st.dataframe(out_df, use_container_width=True)
+            sel = st.selectbox("Box plot column", num_cols)
+            if sel:
+                st.plotly_chart(px.box(cur, y=sel, title=f"Box - {sel}"), use_container_width=True)
         else:
-            st.info("No numeric columns available for outlier analysis.")
-        
-        # Data Types Issues
-        st.write("### 🏷️ Data Type Issues")
-        type_issues = []
-        for col in df.columns:
-            if df[col].dtype == 'object':
-                # Check if numeric values stored as strings
-                try:
-                    pd.to_numeric(df[col], errors='raise')
-                    type_issues.append(f"'{col}' appears to contain numeric data but is stored as text")
-                except:
-                    pass
-        
-        if type_issues:
-            st.warning("⚠️ Potential data type issues:")
-            for issue in type_issues:
-                st.write(f"- {issue}")
-        else:
-            st.success("✅ No obvious data type issues found!")
-    
-    # ---- TAB 3: Cleaning ----
+            st.info("No numeric columns found.")
+
+    # ---------- TAB 3: Cleaning ----------
     with tab3:
-        st.subheader("🛠 Data Cleaning Operations")
-        
-        # Use processed data for cleaning
-        working_df = st.session_state.processed_data.copy()
-        
-        # Missing Values Section
-        st.write("### 🕳️ Handle Missing Values")
-        if working_df.isnull().sum().sum() > 0:
-            missing_method = st.selectbox(
-                "Choose missing value strategy:",
-                ["None", "Drop rows", "Drop columns", "Fill with mean", "Fill with median", "Fill with mode", "Forward fill", "Backward fill"]
-            )
-            
-            if missing_method != "None":
-                missing_threshold = st.slider(
-                    "Missing value threshold (%) - only apply to columns with less missing values",
-                    0, 100, 50
-                )
-                
-                if st.button(f"Apply {missing_method}"):
-                    with st.spinner("Processing missing values..."):
-                        if missing_method == "Drop rows":
-                            working_df = working_df.dropna()
-                        elif missing_method == "Drop columns":
-                            thresh = len(working_df) * (100 - missing_threshold) / 100
-                            working_df = working_df.dropna(axis=1, thresh=thresh)
-                        elif missing_method == "Fill with mean":
-                            numeric_cols = working_df.select_dtypes(include=np.number).columns
-                            working_df[numeric_cols] = working_df[numeric_cols].fillna(working_df[numeric_cols].mean())
-                        elif missing_method == "Fill with median":
-                            numeric_cols = working_df.select_dtypes(include=np.number).columns
-                            working_df[numeric_cols] = working_df[numeric_cols].fillna(working_df[numeric_cols].median())
-                        elif missing_method == "Fill with mode":
-                            for col in working_df.columns:
-                                working_df[col] = working_df[col].fillna(safe_mode_fill(working_df[col]))
-                        elif missing_method == "Forward fill":
-                            working_df = working_df.fillna(method='ffill')
-                        elif missing_method == "Backward fill":
-                            working_df = working_df.fillna(method='bfill')
-                    
-                    st.session_state.processed_data = working_df
-                    st.success(f"✅ Applied {missing_method} successfully!")
-                    st.rerun()
-        else:
-            st.success("✅ No missing values to handle!")
-        
-        # Duplicate Removal
-        st.write("### 🔄 Remove Duplicates")
-        if working_df.duplicated().sum() > 0:
-            if st.button("Remove Duplicate Rows"):
-                working_df = working_df.drop_duplicates()
-                st.session_state.processed_data = working_df
-                st.success("✅ Duplicates removed!")
+        wrk = st.session_state.processed_data.copy()
+
+        st.markdown("### 🕳️ Handle Missing Values")
+        if wrk.isnull().sum().sum() > 0:
+            mcol1, mcol2 = st.columns(2)
+            with mcol1:
+                miss_method = st.selectbox("Strategy", ["None","Drop rows","Drop columns","Fill mean","Fill median","Fill mode","Forward fill","Backward fill"])
+            with mcol2:
+                thresh_pct = st.slider("Drop-column keep-threshold (%)", 0, 100, 50)
+
+            if miss_method != "None" and st.button("Apply Missing Strategy"):
+                if miss_method == "Drop rows":
+                    wrk = wrk.dropna()
+                elif miss_method == "Drop columns":
+                    thresh = len(wrk) * (100 - thresh_pct)/100
+                    wrk = wrk.dropna(axis=1, thresh=thresh)
+                elif miss_method == "Fill mean":
+                    nc = wrk.select_dtypes(include=np.number).columns
+                    wrk[nc] = wrk[nc].fillna(wrk[nc].mean())
+                elif miss_method == "Fill median":
+                    nc = wrk.select_dtypes(include=np.number).columns
+                    wrk[nc] = wrk[nc].fillna(wrk[nc].median())
+                elif miss_method == "Fill mode":
+                    for c in wrk.columns:
+                        wrk[c] = wrk[c].fillna(safe_mode_fill(wrk[c]))
+                elif miss_method == "Forward fill":
+                    wrk = wrk.fillna(method="ffill")
+                elif miss_method == "Backward fill":
+                    wrk = wrk.fillna(method="bfill")
+                st.session_state.processed_data = wrk
+                st.session_state.data_brief = build_data_brief(wrk)
+                st.success("Missing-value strategy applied ✅")
                 st.rerun()
         else:
-            st.success("✅ No duplicates to remove!")
-        
-        # Outlier Handling
-        st.write("### 🚨 Handle Outliers")
-        numeric_cols = working_df.select_dtypes(include=np.number).columns.tolist()
-        
-        if numeric_cols:
-            outlier_columns = st.multiselect(
-                "Select columns for outlier treatment:",
-                numeric_cols,
-                help="Choose which columns to apply outlier treatment"
-            )
-            
-            if outlier_columns:
-                outlier_method = st.selectbox(
-                    "Outlier detection method:",
-                    ["IQR", "Z-Score", "Modified Z-Score"]
-                )
-                
-                outlier_treatment = st.selectbox(
-                    "Outlier treatment:",
-                    ["Remove", "Cap values", "Transform to median"]
-                )
-                
-                if st.button("Apply Outlier Treatment"):
-                    with st.spinner("Processing outliers..."):
-                        for col in outlier_columns:
-                            if outlier_method == "IQR":
-                                Q1 = working_df[col].quantile(0.25)
-                                Q3 = working_df[col].quantile(0.75)
-                                IQR = Q3 - Q1
-                                lower_bound = Q1 - 1.5 * IQR
-                                upper_bound = Q3 + 1.5 * IQR
-                                outlier_mask = (working_df[col] < lower_bound) | (working_df[col] > upper_bound)
-                            
-                            elif outlier_method == "Z-Score":
-                                z_scores = np.abs(stats.zscore(working_df[col].dropna()))
-                                outlier_mask = z_scores > 3
-                            
-                            elif outlier_method == "Modified Z-Score":
-                                median = working_df[col].median()
-                                mad = np.median(np.abs(working_df[col] - median))
-                                modified_z_scores = 0.6745 * (working_df[col] - median) / mad
-                                outlier_mask = np.abs(modified_z_scores) > 3.5
-                            
-                            # Apply treatment
-                            if outlier_treatment == "Remove":
-                                working_df = working_df[~outlier_mask]
-                            elif outlier_treatment == "Cap values":
-                                if outlier_method == "IQR":
-                                    working_df[col] = np.where(working_df[col] < lower_bound, lower_bound,
-                                                             np.where(working_df[col] > upper_bound, upper_bound, working_df[col]))
-                            elif outlier_treatment == "Transform to median":
-                                working_df.loc[outlier_mask, col] = working_df[col].median()
-                    
-                    st.session_state.processed_data = working_df
-                    st.success("✅ Outlier treatment applied!")
-                    st.rerun()
-        
-        # Encoding
-        st.write("### 🔢 Encode Categorical Variables")
-        cat_cols = working_df.select_dtypes(include=['object', 'category']).columns.tolist()
-        
-        if cat_cols:
-            encoding_cols = st.multiselect("Select columns to encode:", cat_cols)
-            
-            if encoding_cols:
-                encoding_method = st.selectbox(
-                    "Encoding method:",
-                    ["Label Encoding", "One-Hot Encoding", "Target Encoding"]
-                )
-                
-                if st.button("Apply Encoding"):
-                    with st.spinner("Applying encoding..."):
-                        if encoding_method == "Label Encoding":
-                            le = LabelEncoder()
-                            for col in encoding_cols:
-                                working_df[col] = le.fit_transform(working_df[col].astype(str))
-                        
-                        elif encoding_method == "One-Hot Encoding":
-                            working_df = pd.get_dummies(working_df, columns=encoding_cols, drop_first=True)
-                        
-                        elif encoding_method == "Target Encoding":
-                            st.warning("Target encoding requires a target variable. Skipping for now.")
-                    
-                    st.session_state.processed_data = working_df
-                    st.success("✅ Encoding applied!")
-                    st.rerun()
-        else:
-            st.info("No categorical columns found for encoding.")
-        
-        # Feature Scaling
-        st.write("### 📏 Feature Scaling")
-        if numeric_cols:
-            scaling_cols = st.multiselect("Select columns for scaling:", numeric_cols)
-            
-            if scaling_cols:
-                scaling_method = st.selectbox(
-                    "Scaling method:",
-                    ["StandardScaler (Z-score normalization)", "MinMaxScaler (0-1 normalization)"]
-                )
-                
-                if st.button("Apply Scaling"):
-                    with st.spinner("Applying scaling..."):
-                        if scaling_method.startswith("StandardScaler"):
-                            scaler = StandardScaler()
+            st.success("No missing values to handle ✅")
+
+        st.markdown("### 🚨 Outlier Handling")
+        num_cols = wrk.select_dtypes(include=np.number).columns.tolist()
+        if num_cols:
+            cols = st.multiselect("Columns", num_cols)
+            method = st.selectbox("Detection", ["IQR","Z-Score","Modified Z-Score"])
+            treat = st.selectbox("Treatment", ["Remove","Cap to bounds","Replace with median"])
+            if cols and st.button("Apply Outlier Treatment"):
+                for c in cols:
+                    s = wrk[c]
+                    if method == "IQR":
+                        Q1, Q3 = s.quantile(.25), s.quantile(.75); IQR = Q3-Q1
+                        lb, ub = Q1-1.5*IQR, Q3+1.5*IQR
+                        mask = (s<lb)|(s>ub)
+                    elif method == "Z-Score":
+                        z = np.abs(stats.zscore(s.dropna()))
+                        mask = pd.Series(False, index=s.index)
+                        mask.loc[s.dropna().index] = z > 3
+                        lb, ub = None, None
+                    else:
+                        med = s.median(); mad = np.median(np.abs(s-med))
+                        if mad == 0:
+                            mask = pd.Series(False, index=s.index); lb, ub = None, None
                         else:
-                            scaler = MinMaxScaler()
-                        
-                        working_df[scaling_cols] = scaler.fit_transform(working_df[scaling_cols])
-                    
-                    st.session_state.processed_data = working_df
-                    st.success("✅ Scaling applied!")
-                    st.rerun()
-        
-        # Show cleaning summary
-        st.write("### 📋 Cleaning Summary")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Original Rows", f"{st.session_state.original_data.shape[0]:,}")
-            st.metric("Original Columns", st.session_state.original_data.shape[1])
-        with col2:
-            st.metric("Current Rows", f"{st.session_state.processed_data.shape[0]:,}")
-            st.metric("Current Columns", st.session_state.processed_data.shape[1])
-    
-    # ---- TAB 4: Visualizations ----
-    with tab4:
-        st.subheader("📊 Interactive Visualizations")
-        
-        working_df = st.session_state.processed_data
-        numeric_cols = working_df.select_dtypes(include=np.number).columns.tolist()
-        cat_cols = working_df.select_dtypes(include=['object', 'category']).columns.tolist()
-        
-        # Visualization controls
-        viz_type = st.selectbox(
-            "Select visualization type:",
-            ["Distribution Plots", "Correlation Analysis", "Categorical Analysis", "Outlier Visualization", "Custom Plots"]
-        )
-        
-        if viz_type == "Distribution Plots" and numeric_cols:
-            selected_cols = st.multiselect(
-                "Select columns for distribution analysis:",
-                numeric_cols,
-                default=numeric_cols[:min(4, len(numeric_cols))]
-            )
-            
-            if selected_cols:
-                plot_type = st.radio("Plot type:", ["Histogram", "Box Plot", "Violin Plot"])
-                
-                if plot_type == "Histogram":
-                    for col in selected_cols:
-                        fig = px.histogram(working_df, x=col, nbins=30, title=f"Distribution of {col}")
-                        st.plotly_chart(fig, use_container_width=True)
-                
-                elif plot_type == "Box Plot":
-                    for col in selected_cols:
-                        fig = px.box(working_df, y=col, title=f"Box Plot - {col}")
-                        st.plotly_chart(fig, use_container_width=True)
-                
-                elif plot_type == "Violin Plot":
-                    for col in selected_cols:
-                        fig = px.violin(working_df, y=col, title=f"Violin Plot - {col}")
-                        st.plotly_chart(fig, use_container_width=True)
-        
-        elif viz_type == "Correlation Analysis" and len(numeric_cols) > 1:
-            corr_matrix = working_df[numeric_cols].corr()
-            
-            fig = px.imshow(
-                corr_matrix,
-                text_auto=True,
-                aspect="auto",
-                title="Correlation Heatmap",
-                color_continuous_scale="RdBu"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # High correlation pairs
-            st.write("### 🔗 High Correlation Pairs (> 0.8)")
-            high_corr = []
-            for i in range(len(corr_matrix.columns)):
-                for j in range(i+1, len(corr_matrix.columns)):
-                    if abs(corr_matrix.iloc[i, j]) > 0.8:
-                        high_corr.append({
-                            'Variable 1': corr_matrix.columns[i],
-                            'Variable 2': corr_matrix.columns[j],
-                            'Correlation': round(corr_matrix.iloc[i, j], 3)
-                        })
-            
-            if high_corr:
-                st.dataframe(pd.DataFrame(high_corr))
-            else:
-                st.info("No high correlations found (> 0.8)")
-        
-        elif viz_type == "Categorical Analysis" and cat_cols:
-            selected_cat = st.selectbox("Select categorical column:", cat_cols)
-            
-            if selected_cat:
-                value_counts = working_df[selected_cat].value_counts()
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    fig = px.bar(x=value_counts.index, y=value_counts.values, title=f"Value Counts - {selected_cat}")
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                with col2:
-                    fig = px.pie(values=value_counts.values, names=value_counts.index, title=f"Distribution - {selected_cat}")
-                    st.plotly_chart(fig, use_container_width=True)
-        
-        elif viz_type == "Custom Plots":
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                x_col = st.selectbox("X-axis:", working_df.columns)
-                y_col = st.selectbox("Y-axis:", working_df.columns)
-            
-            with col2:
-                plot_type = st.selectbox("Plot type:", ["Scatter", "Line", "Bar"])
-                color_col = st.selectbox("Color by (optional):", [None] + list(working_df.columns))
-            
-            if x_col and y_col:
-                if plot_type == "Scatter":
-                    fig = px.scatter(working_df, x=x_col, y=y_col, color=color_col, title=f"{y_col} vs {x_col}")
-                elif plot_type == "Line":
-                    fig = px.line(working_df, x=x_col, y=y_col, color=color_col, title=f"{y_col} vs {x_col}")
-                elif plot_type == "Bar":
-                    fig = px.bar(working_df, x=x_col, y=y_col, color=color_col, title=f"{y_col} vs {x_col}")
-                
-                st.plotly_chart(fig, use_container_width=True)
-    
-    # ---- TAB 5: Export ----
-    with tab5:
-        st.subheader("💾 Export Cleaned Dataset")
-        
-        working_df = st.session_state.processed_data
-        
-        # Export summary
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Rows to Export", f"{len(working_df):,}")
-        with col2:
-            st.metric("Columns to Export", working_df.shape[1])
-        with col3:
-            st.metric("File Size (Est.)", f"{working_df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
-        
-        # Export options
-        export_format = st.selectbox(
-            "Select export format:",
-            ["CSV", "Excel", "JSON", "Parquet", "HTML"]
-        )
-        
-        # File naming with current data info
-        current_file_name = getattr(st.session_state, 'last_uploaded_file', 'data')
-        if current_file_name == "sample_iris_data":
-            default_name = "cleaned_iris_sample"
+                            mz = 0.6745*(s-med)/mad
+                            mask = np.abs(mz) > 3.5
+                            lb, ub = None, None
+                    if treat == "Remove":
+                        wrk = wrk[~mask]
+                    elif treat == "Cap to bounds" and method == "IQR":
+                        wrk[c] = np.where(wrk[c] < lb, lb, np.where(wrk[c] > ub, ub, wrk[c]))
+                    elif treat == "Replace with median":
+                        wrk.loc[mask, c] = s.median()
+                st.session_state.processed_data = wrk
+                st.session_state.data_brief = build_data_brief(wrk)
+                st.success("Outliers handled ✅")
+                st.rerun()
         else:
-            default_name = f"cleaned_{current_file_name.split('.')[0]}" if '.' in current_file_name else "cleaned_data"
-        
-        file_name = st.text_input("File name (without extension):", default_name)
-        
-        # Generate export data
-        if export_format == "CSV":
-            export_data = working_df.to_csv(index=False)
-            mime_type = "text/csv"
-            file_extension = ".csv"
-        
-        elif export_format == "Excel":
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                working_df.to_excel(writer, index=False, sheet_name='Cleaned_Data')
-            export_data = buffer.getvalue()
-            mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            file_extension = ".xlsx"
-        
-        elif export_format == "JSON":
-            export_data = working_df.to_json(orient="records", indent=2)
-            mime_type = "application/json"
-            file_extension = ".json"
-        
-        elif export_format == "Parquet":
-            buffer = io.BytesIO()
-            working_df.to_parquet(buffer, index=False)
-            export_data = buffer.getvalue()
-            mime_type = "application/octet-stream"
-            file_extension = ".parquet"
-        
-        elif export_format == "HTML":
-            export_data = working_df.to_html(index=False, classes='table table-striped')
-            mime_type = "text/html"
-            file_extension = ".html"
-        
-        # Download button
-        st.download_button(
-            label=f"📥 Download {export_format}",
-            data=export_data,
-            file_name=f"{file_name}{file_extension}",
-            mime=mime_type,
-            use_container_width=True
-        )
-        
-        # Preview export data
-        if st.checkbox("Preview export data"):
-            st.subheader("Export Preview")
-            if len(working_df) > 1000:
-                st.warning("Showing first 1000 rows for performance")
-                st.dataframe(working_df.head(1000), use_container_width=True)
+            st.info("No numeric columns.")
+
+        st.markdown("### 🔢 Encoding")
+        cat_cols = wrk.select_dtypes(include=["object","category"]).columns.tolist()
+        if cat_cols:
+            enc_cols = st.multiselect("Categorical columns", cat_cols)
+            enc_method = st.selectbox("Method", ["Label Encoding", "One-Hot Encoding"])
+            if enc_cols and st.button("Apply Encoding"):
+                if enc_method == "Label Encoding":
+                    le = LabelEncoder()
+                    for c in enc_cols:
+                        wrk[c] = le.fit_transform(wrk[c].astype(str))
+                else:
+                    wrk = pd.get_dummies(wrk, columns=enc_cols, drop_first=True)
+                st.session_state.processed_data = wrk
+                st.session_state.data_brief = build_data_brief(wrk)
+                st.success("Encoding applied ✅")
+                st.rerun()
+        else:
+            st.info("No categorical columns.")
+
+        st.markdown("### 📏 Scaling")
+        num_cols = st.session_state.processed_data.select_dtypes(include=np.number).columns.tolist()
+        if num_cols:
+            sc_cols = st.multiselect("Columns to scale", num_cols)
+            sc_method = st.selectbox("Scaler", ["StandardScaler (Z-score)","MinMaxScaler (0-1)"])
+            if sc_cols and st.button("Apply Scaling"):
+                scaler = StandardScaler() if sc_method.startswith("Standard") else MinMaxScaler()
+                wrk = st.session_state.processed_data.copy()
+                wrk[sc_cols] = scaler.fit_transform(wrk[sc_cols])
+                st.session_state.processed_data = wrk
+                st.session_state.data_brief = build_data_brief(wrk)
+                st.success("Scaling applied ✅")
+                st.rerun()
+
+        st.markdown("### 📋 Cleaning Summary")
+        oc, pc = st.columns(2)
+        oc.metric("Original Rows", f"{st.session_state.original_data.shape[0]:,}")
+        oc.metric("Original Cols", st.session_state.original_data.shape[1])
+        pc.metric("Current Rows", f"{st.session_state.processed_data.shape[0]:,}")
+        pc.metric("Current Cols", st.session_state.processed_data.shape[1])
+
+    # ---------- TAB 4: Visualizations ----------
+    with tab4:
+        cur = st.session_state.processed_data
+        num_cols = cur.select_dtypes(include=np.number).columns.tolist()
+        cat_cols = cur.select_dtypes(include=["object","category"]).columns.tolist()
+
+        kind = st.selectbox("Visualization Type", ["Distribution","Correlation","Categorical","Custom"])
+
+        if kind == "Distribution" and num_cols:
+            cols = st.multiselect("Numeric columns", num_cols, default=num_cols[:min(4, len(num_cols))])
+            ptype = st.radio("Plot", ["Histogram","Box","Violin"], horizontal=True)
+            for c in cols:
+                if ptype == "Histogram":
+                    st.plotly_chart(px.histogram(cur, x=c, nbins=30, title=f"Distribution: {c}"), use_container_width=True)
+                elif ptype == "Box":
+                    st.plotly_chart(px.box(cur, y=c, title=f"Box: {c}"), use_container_width=True)
+                else:
+                    st.plotly_chart(px.violin(cur, y=c, title=f"Violin: {c}"), use_container_width=True)
+
+        elif kind == "Correlation" and len(num_cols) > 1:
+            corr = cur[num_cols].corr()
+            st.plotly_chart(px.imshow(corr, text_auto=True, color_continuous_scale="RdBu", title="Correlation Heatmap"), use_container_width=True)
+
+        elif kind == "Categorical" and cat_cols:
+            c = st.selectbox("Categorical column", cat_cols)
+            vc = cur[c].astype(str).value_counts()
+            col1, col2 = st.columns(2)
+            col1.plotly_chart(px.bar(x=vc.index, y=vc.values, labels={"x":c,"y":"count"}, title=f"Counts: {c}"), use_container_width=True)
+            col2.plotly_chart(px.pie(values=vc.values, names=vc.index, title=f"Share: {c}"), use_container_width=True)
+
+        elif kind == "Custom":
+            x = st.selectbox("X", cur.columns)
+            y = st.selectbox("Y", cur.columns, index=min(1, len(cur.columns)-1))
+            color = st.selectbox("Color (optional)", [None] + list(cur.columns))
+            p = st.selectbox("Plot", ["Scatter","Line","Bar"])
+            if p == "Scatter":
+                fig = px.scatter(cur, x=x, y=y, color=color, title=f"{y} vs {x}")
+            elif p == "Line":
+                fig = px.line(cur, x=x, y=y, color=color, title=f"{y} vs {x}")
             else:
-                st.dataframe(working_df, use_container_width=True)
-        
-        # Export report
-        if st.button("Generate Cleaning Report"):
-            st.subheader("📋 Data Cleaning Report")
-            
-            report = f"""
-            # Data Cleaning Report
-            
-            ## Original Dataset
-            - Rows: {st.session_state.original_data.shape[0]:,}
-            - Columns: {st.session_state.original_data.shape[1]}
-            - Memory Usage: {st.session_state.original_data.memory_usage(deep=True).sum() / 1024**2:.2f} MB
-            
-            ## Cleaned Dataset
-            - Rows: {working_df.shape[0]:,}
-            - Columns: {working_df.shape[1]}
-            - Memory Usage: {working_df.memory_usage(deep=True).sum() / 1024**2:.2f} MB
-            
-            ## Changes Made
-            - Rows removed: {st.session_state.original_data.shape[0] - working_df.shape[0]:,}
-            - Columns removed: {st.session_state.original_data.shape[1] - working_df.shape[1]}
-            - Data reduction: {(1 - len(working_df)/len(st.session_state.original_data))*100:.1f}%
-            
-            ## Data Quality Improvements
-            - Missing values handled: ✅
-            - Duplicates removed: ✅ 
-            - Outliers treated: ✅
-            - Data types optimized: ✅
-            """
-            
-            st.markdown(report)
-            
-            # Download report
-            st.download_button(
-                label="📥 Download Report",
-                data=report,
-                file_name="cleaning_report.md",
-                mime="text/markdown"
-            )
+                fig = px.bar(cur, x=x, y=y, color=color, title=f"{y} vs {x}")
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ---------- TAB 5: Export ----------
+    with tab5:
+        cur = st.session_state.processed_data
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Rows", f"{len(cur):,}")
+        c2.metric("Cols", cur.shape[1])
+        c3.metric("Est. Size (MB)", f"{cur.memory_usage(deep=True).sum()/1024**2:.2f}")
+
+        fmt = st.selectbox("Format", ["CSV","Excel","JSON","Parquet","HTML"])
+        base = st.text_input("File name (no ext.)", f"cleaned_{(st.session_state.last_uploaded_file or 'data').split('.')[0]}")
+        if fmt == "CSV":
+            data, mime, ext = cur.to_csv(index=False), "text/csv", ".csv"
+        elif fmt == "Excel":
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                cur.to_excel(w, index=False, sheet_name="Cleaned")
+            data, mime, ext = buf.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx"
+        elif fmt == "JSON":
+            data, mime, ext = cur.to_json(orient="records", indent=2), "application/json", ".json"
+        elif fmt == "Parquet":
+            buf = io.BytesIO(); cur.to_parquet(buf, index=False); data, mime, ext = buf.getvalue(), "application/octet-stream", ".parquet"
+        else:
+            data, mime, ext = cur.to_html(index=False), "text/html", ".html"
+
+        st.download_button(f"📥 Download {fmt}", data=data, file_name=f"{base}{ext}", mime=mime, use_container_width=True)
+
+    # ---------- TAB 6: 🤖 Gemini Chat ----------
+    with tab6:
+        st.subheader("🤖 Dataset-aware AI Chat (Gemini)")
+        st.caption("Ask questions about your uploaded/cleaned dataset. The model uses a compact profile of your data, not the entire file.")
+
+        # Ensure chat session
+        chat = ensure_gemini()
+        if chat is None:
+            st.stop()
+
+        # Show current brief & controls
+        with st.expander("📄 Data Brief sent to Gemini (read-only)", expanded=False):
+            st.code(st.session_state.data_brief, language="text")
+
+        # Chat UI
+        if "chat_messages" not in st.session_state:
+            st.session_state.chat_messages = []
+
+        # Display history
+        for role, msg in st.session_state.chat_messages:
+            if role == "user":
+                st.markdown(f"**You:** {msg}")
+            else:
+                st.markdown(f"**Gemini:** {msg}")
+
+        # Input
+        q = st.text_input("Ask about the data (e.g., outliers, missing, correlations, summaries):", key="gemini_q")
+        col_a, col_b = st.columns([1,1])
+        with col_a:
+            send = st.button("Ask Gemini", type="primary", use_container_width=True)
+        with col_b:
+            if st.button("Clear Chat", use_container_width=True):
+                st.session_state.gemini_chat = None
+                st.session_state.chat_messages = []
+                chat = ensure_gemini()
+                st.experimental_rerun()
+
+        if send and q:
+            cur = st.session_state.processed_data
+            # Refresh brief to reflect latest cleaning
+            brief = build_data_brief(cur)
+            st.session_state.data_brief = brief
+
+            system_prompt = f"""
+You are a senior data analyst. You answer based on the user's question and the dataset brief provided below.
+- If the user asks for column-specific calculations, reference column names exactly.
+- If a direct numeric answer isn't possible from the brief, explain what additional step the user can run in the app (e.g., 'check Visualizations > Correlation' or 'apply outlier treatment IQR').
+- Prefer concise bullet points and short formulas when useful.
+- Never invent columns that don't exist.
+
+DATASET BRIEF:
+{brief}
+"""
+
+            try:
+                resp = chat.send_message([system_prompt, f"USER QUESTION: {q}"])
+                answer = resp.text
+            except Exception as e:
+                answer = f"Error from Gemini: {e}"
+
+            st.session_state.chat_messages.append(("user", q))
+            st.session_state.chat_messages.append(("assistant", answer))
+            st.experimental_rerun()
 
 else:
-    # Welcome message
+    # Welcome / Sample
     st.markdown("""
-    ## Welcome to the Advanced Data Profiling & Cleaning App! 🎉
-    
-    ### Features:
-    - 📊 **Interactive Data Exploration** with pagination for large datasets
-    - 🔍 **Comprehensive Data Quality Assessment** 
-    - 🛠 **Advanced Cleaning Operations** with multiple methods
-    - 📈 **Interactive Visualizations** using Plotly
-    - 💾 **Multiple Export Formats** with detailed reports
-    - 🚀 **Performance Optimized** with caching and progress bars
-    
-    ### Getting Started:
-    1. Upload your CSV or Excel file using the sidebar
-    2. Explore your data in the **Overview** tab
-    3. Check data quality issues in the **Data Quality** tab
-    4. Apply cleaning operations in the **Cleaning** tab
-    5. Create visualizations in the **Visualizations** tab
-    6. Export your cleaned data in the **Export** tab
-    
-    ### Supported Operations:
-    - Missing value handling (8 different methods)
-    - Duplicate detection and removal
-    - Outlier detection (IQR, Z-Score, Modified Z-Score)
-    - Categorical encoding (Label, One-Hot)
-    - Feature scaling (Standard, MinMax)
-    - Data type optimization
-    
-    **Upload your dataset to get started!** 📁
+    ## Welcome! 🎉
+    Upload a CSV/Excel from the sidebar to begin. Or try a sample:
     """)
-    
-    # Sample data option
-    st.markdown("### 🎯 Try with Sample Data")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("Load Sample Dataset (Iris)", type="secondary"):
-            # Create sample dataset
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Load Sample Iris"):
             from sklearn.datasets import load_iris
             iris = load_iris()
-            sample_df = pd.DataFrame(iris.data, columns=iris.feature_names)
-            sample_df['species'] = pd.Categorical.from_codes(iris.target, iris.target_names)
-            
-            # Add some missing values and outliers for demonstration
-            np.random.seed(42)
-            sample_df.loc[np.random.choice(sample_df.index, 10), 'sepal length (cm)'] = np.nan
-            sample_df.loc[np.random.choice(sample_df.index, 5), 'petal width (cm)'] = 10.0  # outlier
-            
-            st.session_state.original_data = sample_df.copy()
-            st.session_state.processed_data = sample_df.copy()
-            st.session_state.last_uploaded_file = "sample_iris_data"
-            st.success("✅ Sample dataset loaded! Refresh the page to see the tabs.")
+            df = pd.DataFrame(iris.data, columns=iris.feature_names)
+            df["species"] = pd.Categorical.from_codes(iris.target, iris.target_names)
+            # Add some NA and outliers
+            np.random.seed(7)
+            df.loc[np.random.choice(df.index, 10), "sepal length (cm)"] = np.nan
+            df.loc[np.random.choice(df.index, 5), "petal width (cm)"] = 10.0
+            st.session_state.original_data = df.copy()
+            st.session_state.processed_data = df.copy()
+            st.session_state.last_uploaded_file = "iris_sample.csv"
+            st.session_state.data_brief = build_data_brief(df)
+            st.success("Sample loaded ✅")
             st.rerun()
-    
-    with col2:
-        if st.button("Clear All Data", type="primary"):
-            # Clear all session state data
-            st.session_state.original_data = None
-            st.session_state.processed_data = None
-            if 'last_uploaded_file' in st.session_state:
-                del st.session_state.last_uploaded_file
-            st.success("✅ All data cleared!")
+    with c2:
+        if st.button("Clear All Data"):
+            for k in ["processed_data","original_data","last_uploaded_file","data_brief"]:
+                st.session_state[k] = None
+            st.success("Cleared ✅")
             st.rerun()
-
-# ---- Additional Utility Functions ----
-def generate_data_report(original_df, processed_df):
-    """Generate comprehensive data cleaning report"""
-    report = {
-        'original_shape': original_df.shape,
-        'processed_shape': processed_df.shape,
-        'missing_values_before': original_df.isnull().sum().sum(),
-        'missing_values_after': processed_df.isnull().sum().sum(),
-        'duplicates_before': original_df.duplicated().sum(),
-        'duplicates_after': processed_df.duplicated().sum(),
-        'data_types_before': original_df.dtypes.value_counts().to_dict(),
-        'data_types_after': processed_df.dtypes.value_counts().to_dict()
-    }
-    return report
-
-@st.cache_data
-def calculate_data_profile(df):
-    """Calculate comprehensive data profile"""
-    profile = {}
-    
-    for col in df.columns:
-        col_profile = {
-            'dtype': str(df[col].dtype),
-            'missing_count': df[col].isnull().sum(),
-            'missing_percent': (df[col].isnull().sum() / len(df)) * 100,
-            'unique_count': df[col].nunique(),
-            'unique_percent': (df[col].nunique() / len(df)) * 100
-        }
-        
-        if df[col].dtype in ['int64', 'float64']:
-            col_profile.update({
-                'min': df[col].min(),
-                'max': df[col].max(),
-                'mean': df[col].mean(),
-                'median': df[col].median(),
-                'std': df[col].std(),
-                'skewness': df[col].skew(),
-                'kurtosis': df[col].kurtosis()
-            })
-        else:
-            col_profile.update({
-                'top_value': df[col].mode().iloc[0] if len(df[col].mode()) > 0 else None,
-                'top_value_freq': df[col].value_counts().iloc[0] if len(df[col]) > 0 else 0
-            })
-        
-        profile[col] = col_profile
-    
-    return profile
-
-# Performance monitoring
-@st.cache_data
-def get_memory_usage(df):
-    """Get detailed memory usage information"""
-    memory_usage = df.memory_usage(deep=True)
-    total_memory = memory_usage.sum()
-    
-    return {
-        'total_mb': total_memory / 1024**2,
-        'by_column': memory_usage.to_dict(),
-        'dtypes_memory': df.groupby(df.dtypes).size().to_dict()
-    }
-
-# Advanced data validation functions
-def validate_data_integrity(df):
-    """Validate data integrity and return issues"""
-    issues = []
-    
-    # Check for completely empty columns
-    empty_cols = df.columns[df.isnull().all()].tolist()
-    if empty_cols:
-        issues.append(f"Empty columns found: {empty_cols}")
-    
-    # Check for columns with single value
-    single_value_cols = []
-    for col in df.columns:
-        if df[col].nunique() == 1:
-            single_value_cols.append(col)
-    
-    if single_value_cols:
-        issues.append(f"Columns with single value: {single_value_cols}")
-    
-    # Check for potential ID columns
-    potential_ids = []
-    for col in df.columns:
-        if df[col].nunique() == len(df) and not df[col].isnull().any():
-            potential_ids.append(col)
-    
-    if potential_ids:
-        issues.append(f"Potential ID columns (all unique): {potential_ids}")
-    
-    # Check for high cardinality categorical columns
-    high_card_cats = []
-    cat_cols = df.select_dtypes(include=['object']).columns
-    for col in cat_cols:
-        if df[col].nunique() > len(df) * 0.5:  # More than 50% unique values
-            high_card_cats.append(col)
-    
-    if high_card_cats:
-        issues.append(f"High cardinality categorical columns: {high_card_cats}")
-    
-    return issues
-
-# Data transformation suggestions
-def suggest_transformations(df):
-    """Suggest data transformations based on data characteristics"""
-    suggestions = []
-    
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    
-    for col in numeric_cols:
-        # Check skewness
-        skewness = df[col].skew()
-        if abs(skewness) > 2:
-            if skewness > 2:
-                suggestions.append(f"'{col}' is highly right-skewed (skew={skewness:.2f}). Consider log transformation.")
-            else:
-                suggestions.append(f"'{col}' is highly left-skewed (skew={skewness:.2f}). Consider square transformation.")
-        
-        # Check for potential scaling needs
-        if df[col].std() > df[col].mean() * 10:
-            suggestions.append(f"'{col}' has high variance. Consider scaling.")
-        
-        # Check for potential categorical encoded as numeric
-        if df[col].nunique() < 10 and df[col].dtype in ['int64']:
-            unique_vals = sorted(df[col].dropna().unique())
-            if len(unique_vals) > 1 and all(isinstance(x, (int, np.integer)) for x in unique_vals):
-                suggestions.append(f"'{col}' might be categorical data encoded as numeric (unique values: {unique_vals}).")
-    
-    return suggestions
-
-# Export enhanced functionality
-def create_enhanced_export(df, format_type, include_metadata=True):
-    """Create enhanced export with metadata and formatting"""
-    
-    if format_type == "Excel Enhanced":
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            # Main data sheet
-            df.to_excel(writer, sheet_name='Cleaned_Data', index=False)
-            
-            # Metadata sheet
-            if include_metadata:
-                metadata = pd.DataFrame({
-                    'Metric': ['Total Rows', 'Total Columns', 'Missing Values', 'Duplicate Rows', 'Memory Usage (MB)'],
-                    'Value': [
-                        len(df),
-                        len(df.columns),
-                        df.isnull().sum().sum(),
-                        df.duplicated().sum(),
-                        round(df.memory_usage(deep=True).sum() / 1024**2, 2)
-                    ]
-                })
-                metadata.to_excel(writer, sheet_name='Metadata', index=False)
-                
-                # Column info sheet
-                col_info = pd.DataFrame({
-                    'Column': df.columns,
-                    'Data_Type': df.dtypes.values,
-                    'Non_Null_Count': df.count().values,
-                    'Unique_Values': df.nunique().values,
-                    'Missing_Percent': (df.isnull().sum() / len(df) * 100).round(2).values
-                })
-                col_info.to_excel(writer, sheet_name='Column_Info', index=False)
-        
-        return buffer.getvalue()
-    
-    return None
-
-# Add footer with additional information
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #666;'>
-    <p>Made with ❤️ using Streamlit | 
-    <strong>Features:</strong> Interactive EDA • Advanced Cleaning • Smart Visualizations • Multiple Export Formats</p>
-    <p><strong>Tip:</strong> Use the sidebar to upload your data and navigate through the tabs for a complete data cleaning workflow!</p>
-</div>
-""", unsafe_allow_html=True)
