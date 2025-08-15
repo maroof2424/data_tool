@@ -15,7 +15,8 @@ import cv2
 from deepface import DeepFace
 from PIL import Image
 import time
-
+if not hasattr(st, "experimental_rerun"):
+    st.experimental_rerun = st.rerun
 # ===================== Page Config & Styles =====================
 st.set_page_config(page_title="Advanced Data Profiling + Face Auth",
                    layout="wide",
