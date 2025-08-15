@@ -10,3 +10,4 @@ pillow
 openpyxl
 streamlit-webrtc
 deepface
+tf-keras
