@@ -5,9 +5,10 @@ scipy
 plotly
 scikit-learn
 opencv-python-headless==4.11.0.86
-google-generativeai
 pillow
 openpyxl
+time
 streamlit-webrtc
+tensorflow==2.11.1  
 deepface
-tf-keras
+google-generativeai
