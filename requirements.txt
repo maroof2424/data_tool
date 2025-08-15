@@ -1,3 +1,4 @@
+# Core libraries
 streamlit
 pandas
 numpy
@@ -7,8 +8,13 @@ scikit-learn
 opencv-python-headless==4.11.0.86
 pillow
 openpyxl
-time
+
+# WebRTC support
 streamlit-webrtc
-tensorflow==2.11.1  
+
+# Deep learning
+tensorflow==2.11.1
 deepface
+
+# Google Generative AI
 google-generativeai
