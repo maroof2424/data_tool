@@ -171,11 +171,10 @@ def register_user_face():
                 st.session_state.register_user_id = ""
                 st.session_state.register_upload = None
                 st.rerun()
-        st.stop()
+        st.stop()  # Force stop so form dobara na chale
 
     # Normal registration form
     st.text_input("Enter User ID/Name:", key="register_user_id")
-
     option = st.radio("Face Recognition Model", ["Facenet"], key="register_model")
 
     st.subheader("📷 Option 1: Upload Photo")
@@ -187,18 +186,20 @@ def register_user_face():
 
     st.subheader("📹 Option 2: Webcam Capture")
     from streamlit_webrtc import webrtc_streamer
-    ctx = webrtc_streamer(
+    webrtc_streamer(
         key=f"webcam_register_{st.session_state.get('register_user_id', 'new')}",
         video_transformer_factory=None,
         media_stream_constraints={"video": True, "audio": False}
     )
 
+    # Done button → state set → rerun
     if st.button("✅ Done", key="register_done"):
-        # Save registration state
-        st.session_state.registration_complete = True
-        st.session_state.just_registered_user = st.session_state.get("register_user_id", "")
-        st.rerun()
-
+        if st.session_state.get("register_user_id", "").strip() == "":
+            st.warning("⚠️ Please enter a User ID/Name before continuing.")
+        else:
+            st.session_state.registration_complete = True
+            st.session_state.just_registered_user = st.session_state.get("register_user_id", "")
+            st.rerun()
 
 def face_login():
     st.markdown('<div class="auth-container"><h3>🔐 Face Authentication Login</h3></div>', unsafe_allow_html=True)
