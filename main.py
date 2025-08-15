@@ -145,33 +145,47 @@ def authenticate_face(test_embedding, registered_users, model_name="Facenet", th
         except Exception as e:
             st.error(f"Verification error for {user_id}: {str(e)}")
     return False, None
-
 def register_user_face():
     st.markdown('<div class="auth-container"><h3>👤 Register New User</h3></div>', unsafe_allow_html=True)
-    
+
+    # User inputs
     user_id = st.text_input("Enter User ID/Name:", key="register_user_id")
-    model_name = st.selectbox("Face Recognition Model", ["Facenet", "VGG-Face", "DeepFace", "ArcFace"], key="register_model")
-    
+    model_name = st.selectbox(
+        "Face Recognition Model",
+        ["Facenet", "VGG-Face", "DeepFace", "ArcFace"],
+        key="register_model"
+    )
+
     st.subheader("📷 Option 1: Upload Photo")
-    uploaded_face = st.file_uploader("Upload a clear photo with one face", type=['jpg', 'jpeg', 'png'], key="register_upload")
-    
-    if uploaded_face is not None and user_id:
+    uploaded_face = st.file_uploader(
+        "Upload a clear photo with one face",
+        type=['jpg', 'jpeg', 'png'],
+        key="register_upload"
+    )
+
+    # Only process if file is uploaded & user_id provided
+    if uploaded_face and user_id:
         image = Image.open(uploaded_face)
         st.image(image, caption="Uploaded Photo", width=300)
-        
+
         if st.button("Register with Uploaded Photo", key="register_upload_btn"):
             with st.spinner("Processing face..."):
                 embedding, error = encode_face_from_image(image, model_name)
+                
                 if embedding is not None:
+                    # Save embedding to session
                     st.session_state.registered_users[user_id] = embedding
-                    st.markdown(f'<div class="success-auth">✅ User "{user_id}" registered successfully!</div>', unsafe_allow_html=True)
+                    
+                    st.success(f'✅ User "{user_id}" registered successfully!')
                     st.balloons()
-                    time.sleep(1)
-                    st.rerun()
+                    
+                    # Reset input fields without full rerun
+                    st.session_state.register_user_id = ""
+                    st.session_state.register_upload = None
                 else:
-                    st.markdown(f'<div class="failed-auth">❌ Registration failed: {error}</div>', unsafe_allow_html=True)
+                    st.error(f"❌ Registration failed: {error}")
                     st.info("💡 Ensure the image is well-lit, shows only one face, and is not blurry.")
-    
+   
     st.subheader("📹 Option 2: Webcam Capture")
     ctx = webrtc_streamer(key="register_webcam", video_transformer_factory=lambda: DeepFaceTransformer(model_name))
     
