@@ -1,4 +1,4 @@
-﻿streamlit
+streamlit
 pandas
 numpy
 scipy
@@ -6,9 +6,7 @@ plotly
 scikit-learn
 opencv-python-headless==4.11.0.86
 google-generativeai
-opencv-python
 pillow
 openpyxl
 streamlit-webrtc
-
 deepface
