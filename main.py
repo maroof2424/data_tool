@@ -96,25 +96,46 @@ class DeepFaceTransformer(VideoTransformerBase):
             self.error = f"Error processing webcam frame: {str(e)}"
         
         return img
-
 def encode_face_from_image(image, model_name="Facenet"):
     try:
+        # Convert PIL image to NumPy array
         img_array = np.array(image)
+        # Ensure image is in RGB format (handle RGBA or other formats)
+        if img_array.shape[-1] == 4:
+            img_array = img_array[..., :3]  # Drop alpha channel if RGBA
         rgb_image = img_array if img_array.shape[-1] == 3 else cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
         
+        # Debug: Log image shape
+        st.write(f"Debug: Image shape: {rgb_image.shape}, dtype: {rgb_image.dtype}")
+
+        # Extract faces with DeepFace
         result = DeepFace.extract_faces(rgb_image, detector_backend="opencv", enforce_detection=False)
-        if not result or len(result) == 0 or not result[0]["face"]:
+        
+        # Debug: Log DeepFace result
+        st.write(f"Debug: DeepFace result: {len(result)} faces detected")
+
+        # Check if result is valid
+        if not result or len(result) == 0:
             return None, "No face detected in the image. Please ensure a clear face is visible."
         elif len(result) > 1:
             return None, "Multiple faces detected. Please upload an image with only one face."
         
         face = result[0]["face"]
-        face_uint8 = (face * 255).astype(np.uint8) if face.max() <= 1.0 else face
+        # Debug: Log face array details
+        st.write(f"Debug: Face shape: {face.shape}, max value: {face.max()}, dtype: {face.dtype}")
+
+        # Check if face array is valid
+        if face.size == 0 or face is None:
+            return None, "Empty or invalid face array detected. Please ensure a clear face is visible."
+        
+        # Normalize face array if needed
+        face_uint8 = (face * 255).astype(np.uint8) if face.max() <= 1.0 else face.astype(np.uint8)
+        
+        # Generate face embedding
         embedding = DeepFace.represent(face_uint8, model_name=model_name, detector_backend="skip")[0]["embedding"]
         return embedding, None
     except Exception as e:
         return None, f"Error processing image: {str(e)}"
-
 def authenticate_face(test_embedding, registered_users, model_name="Facenet", threshold=10):
     for user_id, ref_embedding in registered_users.items():
         try:
