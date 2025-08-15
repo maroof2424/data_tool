@@ -156,12 +156,14 @@ def register_user_face():
         u = st.session_state.just_registered_user
         st.success(f'🎉 User "{u}" registered successfully!')
         st.caption("You’re all set. Continue to the app or register another user.")
+
         col1, col2 = st.columns(2)
         with col1:
             if st.button("➡️ Continue to App (Auto-Login)", key="reg_go_to_app"):
                 st.session_state.authenticated = True
                 st.session_state.current_user = u
                 st.rerun()
+
         with col2:
             if st.button("↩️ Register Another User", key="reg_another_user"):
                 st.session_state.registration_complete = False
@@ -170,6 +172,25 @@ def register_user_face():
                 st.session_state.register_upload = None
                 st.rerun()
         st.stop()
+
+    # Start webcam capture
+    ctx = webrtc_streamer(
+        key="register_webcam",
+        video_transformer_factory=lambda: DeepFaceTransformer(model_name)
+    )
+
+    # When Done is clicked
+    if st.button("✅ Done"):
+        # Save user face here...
+        st.session_state.registration_complete = True
+        st.session_state.just_registered_user = st.session_state.register_user_id
+
+        # Stop webcam if running
+        if ctx and ctx.state.playing:
+            ctx.stop()
+
+        st.rerun()
+
 
     # Normal registration UI
     user_id = st.text_input("Enter User ID/Name:", key="register_user_id")
