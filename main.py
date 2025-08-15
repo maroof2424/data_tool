@@ -151,9 +151,9 @@ def authenticate_face(test_embedding, registered_users, threshold=10.0):
 def register_user_face():
     st.markdown('<div class="auth-container"><h3>👤 Register New User</h3></div>', unsafe_allow_html=True)
 
-    # If just registered, show success view (prevents rerun-loop)
-    if st.session_state.registration_complete:
-        u = st.session_state.just_registered_user
+    # Agar register ho chuka hai to success screen dikhao
+    if st.session_state.get("registration_complete", False):
+        u = st.session_state.get("just_registered_user", "")
         st.success(f'🎉 User "{u}" registered successfully!')
         st.caption("You’re all set. Continue to the app or register another user.")
 
@@ -162,8 +162,8 @@ def register_user_face():
             if st.button("➡️ Continue to App (Auto-Login)", key="reg_go_to_app"):
                 st.session_state.authenticated = True
                 st.session_state.current_user = u
+                st.session_state.show_register = False  # Registration page se nikalne ka flag
                 st.rerun()
-
         with col2:
             if st.button("↩️ Register Another User", key="reg_another_user"):
                 st.session_state.registration_complete = False
@@ -173,75 +173,31 @@ def register_user_face():
                 st.rerun()
         st.stop()
 
-    # Start webcam capture
-    ctx = webrtc_streamer(
-        key="register_webcam",
-        video_transformer_factory=lambda: DeepFaceTransformer(model_name)
-    )
+    # Normal registration form
+    st.text_input("Enter User ID/Name:", key="register_user_id")
 
-    # When Done is clicked
-    if st.button("✅ Done"):
-        # Save user face here...
-        st.session_state.registration_complete = True
-        st.session_state.just_registered_user = st.session_state.register_user_id
-
-        # Stop webcam if running
-        if ctx and ctx.state.playing:
-            ctx.stop()
-
-        st.rerun()
-
-
-    # Normal registration UI
-    user_id = st.text_input("Enter User ID/Name:", key="register_user_id")
-    model_name = st.selectbox("Face Recognition Model",
-                              ["Facenet", "VGG-Face", "DeepFace", "ArcFace"],
-                              key="register_model")
+    option = st.radio("Face Recognition Model", ["Facenet"], key="register_model")
 
     st.subheader("📷 Option 1: Upload Photo")
-    uploaded_face = st.file_uploader("Upload a clear photo with one face",
-                                     type=['jpg', 'jpeg', 'png'],
-                                     key="register_upload")
-
-    if uploaded_face and user_id:
-        image = Image.open(uploaded_face).convert("RGB")
-        st.image(image, caption="Uploaded Photo", width=300)
-
-        if st.button("Register with Uploaded Photo", key="register_upload_btn"):
-            with st.spinner("Processing face..."):
-                embedding, error = encode_face_from_image(image, model_name)
-                if embedding is not None:
-                    st.session_state.registered_users[user_id] = embedding
-                    st.session_state.registration_complete = True
-                    st.session_state.just_registered_user = user_id
-                    st.balloons()
-                    st.rerun()
-                else:
-                    st.error(f"❌ Registration failed: {error}")
-                    st.info("💡 Use a well-lit, sharp image with a single face.")
+    st.file_uploader(
+        "Upload a clear photo with one face",
+        type=["jpg", "jpeg", "png"],
+        key="register_upload"
+    )
 
     st.subheader("📹 Option 2: Webcam Capture")
+    from streamlit_webrtc import webrtc_streamer
     ctx = webrtc_streamer(
-        key="register_webcam",
-        video_transformer_factory=lambda: DeepFaceTransformer(model_name),
+        key=f"webcam_register_{st.session_state.get('register_user_id', 'new')}",
+        video_transformer_factory=None,
         media_stream_constraints={"video": True, "audio": False}
     )
 
-    if ctx and ctx.video_transformer and user_id:
-        if st.button("Capture and Register", key="webcam_register_btn"):
-            with st.spinner("Processing webcam frame..."):
-                transformer = ctx.video_transformer
-                if transformer.error:
-                    st.markdown(f'<div class="failed-auth">❌ Registration failed: {transformer.error}</div>', unsafe_allow_html=True)
-                    st.info("💡 Ensure only one face is visible and lighting is good.")
-                elif transformer.face_embedding is not None:
-                    st.session_state.registered_users[user_id] = transformer.face_embedding
-                    st.session_state.registration_complete = True
-                    st.session_state.just_registered_user = user_id
-                    st.balloons()
-                    st.rerun()
-                else:
-                    st.markdown('<div class="failed-auth">❌ Could not process webcam frame.</div>', unsafe_allow_html=True)
+    if st.button("✅ Done", key="register_done"):
+        # Save registration state
+        st.session_state.registration_complete = True
+        st.session_state.just_registered_user = st.session_state.get("register_user_id", "")
+        st.rerun()
 
 
 def face_login():
